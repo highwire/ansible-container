@@ -33,7 +33,8 @@ import container
 from container import host_only, conductor_only
 from container.engine import BaseEngine
 from container import utils, exceptions
-from container.utils import logmux, text, ordereddict_to_list
+from container.utils import (logmux, text, ordereddict_to_list, roles_to_install, modules_to_install,
+                             ansible_config_exists, create_file)
 from .secrets import DockerSecretsMixin
 
 try:
@@ -76,9 +77,10 @@ REMOVE_HTTP = re.compile('^https?://')
 # A map of distros and their aliases that we build pre-baked builders for
 PREBAKED_DISTROS = {
     'centos:7': ['centos:latest', 'centos:centos7'],
-    'fedora:26': ['fedora:latest'],
+    'fedora:27': ['fedora:latest'],
+    'fedora:26': [],
     'fedora:25': [],
-    'fedora:24': [],
+    'amazonlinux:2': ['amazonlinux:2'],
     'debian:jessie': ['debian:8', 'debian:latest', 'debian:jessie-slim'],
     'debian:stretch': ['debian:9', 'debian:stretch-slim'],
     'debian:wheezy': ['debian:7', 'debian:wheezy-slim'],
@@ -140,7 +142,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
     COMPOSE_WHITELIST = (
         'links', 'depends_on', 'cap_add', 'cap_drop', 'command', 'devices',
         'dns', 'dns_opt', 'tmpfs', 'entrypoint', 'environment', 'expose',
-        'external_links', 'labels', 'links', 'logging', 'log_opt', 'networks',
+        'external_links', 'extra_hosts', 'labels', 'links', 'logging', 'log_opt', 'networks',
         'network_mode', 'pids_limit', 'ports', 'security_opt', 'stop_grace_period',
         'stop_signal', 'sysctls', 'ulimits', 'userns_mode', 'volumes',
         'volume_driver', 'volumes_from', 'cpu_shares', 'cpu_quota', 'cpuset',
@@ -154,6 +156,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
     _client = None
 
     FINGERPRINT_LABEL_KEY = 'com.ansible.container.fingerprint'
+    ROLE_LABEL_KEY = 'com.ansible.container.role'
     LAYER_COMMENT = 'Built with Ansible Container (https://github.com/ansible/ansible-container)'
 
     @property
@@ -165,6 +168,8 @@ class Engine(BaseEngine, DockerSecretsMixin):
             except DockerException as exc:
                 if 'Connection refused' in str(exc):
                     raise exceptions.AnsibleContainerDockerConnectionRefused()
+                elif 'Connection aborted' in str(exc):
+                    raise exceptions.AnsibleContainerDockerConnectionAborted(u"%s" % str(exc))
                 else:
                     raise
         return self._client
@@ -198,7 +203,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
 
     @property
     def secrets_mount_path(self):
-        return os.path.join(os.sep, 'run', 'secrets')
+        return os.path.join(os.sep, 'docker', 'secrets')
 
     def container_name_for_service(self, service_name):
         return u'%s_%s' % (self.project_name, service_name)
@@ -315,16 +320,24 @@ class Engine(BaseEngine, DockerSecretsMixin):
         pswd_file = params.get('vault_password_file') or config.get('settings', {}).get('vault_password_file')
         if pswd_file:
             pswd_file_path = os.path.normpath(os.path.abspath(os.path.expanduser(pswd_file)))
-            volumes[pswd_file_path] = {
-                'bind': pswd_file_path,
-                'mode': 'ro'
-            }
-            params['vault_password_file'] = pswd_file_path
+            if not os.path.exists(pswd_file_path):
+                logger.warning(u'Vault file %s specified but does not exist. Ignoring it.',
+                               pswd_file_path)
+            else:
+                volumes[pswd_file_path] = {
+                    'bind': pswd_file_path,
+                    'mode': 'ro'
+                }
+                params['vault_password_file'] = pswd_file_path
 
         vaults = params.get('vault_files') or config.get('settings', {}).get('vault_files')
         if vaults:
             vault_paths = [os.path.normpath(os.path.abspath(os.path.expanduser(v))) for v in vaults]
             for vault_path in vault_paths:
+                if not os.path.exists(vault_path):
+                    logger.warning(u'Vault file %s specified but does not exist. Ignoring it.',
+                                   vault_path)
+                    continue
                 volumes[vault_path] = {
                     'bind': vault_path,
                     'mode': 'ro'
@@ -336,7 +349,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
             src_path = params['src_mount_path']
         else:
             src_path = base_path
-        volumes[src_path] = {'bind': '/src', 'mode': permissions}
+        volumes[src_path] = {'bind': '/_src', 'mode': permissions}
 
         if params.get('deployment_output_path'):
             deployment_path = params['deployment_output_path']
@@ -398,6 +411,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
 
         if command in ('login', 'push', 'build'):
             config_path = params.get('config_path') or self.auth_config_path
+            create_file(config_path, '{}')
             volumes[config_path] = {'bind': config_path,
                                     'mode': 'rw'}
 
@@ -478,19 +492,34 @@ class Engine(BaseEngine, DockerSecretsMixin):
                         if os.path.exists(os.path.join(output_path, filename)):
                             os.remove(os.path.join(output_path, filename))
 
-    def service_is_running(self, service):
+    def service_is_running(self, service, container_id=None):
         try:
-            running_container = self.client.containers.get(self.container_name_for_service(service))
+            running_container = self.client.containers.get(
+                container_id or self.container_name_for_service(service))
             return running_container.status == 'running' and running_container.id
         except docker_errors.NotFound:
             return False
 
-    def service_exit_code(self, service):
+    def service_exit_code(self, service, container_id=None):
         try:
-            container_info = self.client.api.inspect_container(self.container_name_for_service(service))
+            container_info = self.client.api.inspect_container(
+                container_id or self.container_name_for_service(service))
             return container_info['State']['ExitCode']
         except docker_errors.APIError:
             return None
+
+    def start_container(self, container_id):
+        try:
+            to_start = self.client.containers.get(container_id)
+        except docker_errors.APIError:
+            logger.debug(u"Could not find container %s to start", container_id,
+                         id=container_id)
+        else:
+            to_start.start()
+            log_iter = to_start.logs(stdout=True, stderr=True, stream=True)
+            mux = logmux.LogMultiplexer()
+            mux.add_iterator(log_iter, plainLogger)
+            return to_start.id
 
     def stop_container(self, container_id, forcefully=False):
         try:
@@ -522,27 +551,48 @@ class Engine(BaseEngine, DockerSecretsMixin):
         else:
             to_delete.remove(v=remove_volumes)
 
-    def get_container_id_for_service(self, service_name):
+    def get_image_id_for_container_id(self, container_id):
         try:
-            container_info = self.client.containers.get(self.container_name_for_service(service_name))
+            container_info = self.client.containers.get(container_id)
         except docker_errors.NotFound:
-            logger.debug("Could not find container for %s", service_name,
-                         container=self.container_name_for_service(service_name),
+            logger.debug("Could not find container for %s", container_id,
                          all_containers=self.client.containers.list())
+            return None
+        else:
+            return container_info.image.id
+
+    def get_container_id_by_name(self, name):
+        try:
+            container_info = self.client.containers.get(name)
+        except docker_errors.NotFound:
+            logger.debug("Could not find container for %s", name,
+                         all_containers=[
+                             c.name for c in self.client.containers.list(all=True)])
             return None
         else:
             return container_info.id
 
+    def get_intermediate_containers_for_service(self, service_name):
+        container_substring = self.container_name_for_service(service_name)
+        for container in self.client.containers.list(all=True):
+            if container.name.startswith(container_substring) and \
+                            container.name != container_substring:
+                yield container.name
+
     def get_image_id_by_fingerprint(self, fingerprint):
         try:
-            image, = self.client.images.list(
+            image = self.client.images.list(
                 all=True,
                 filters=dict(label='%s=%s' % (self.FINGERPRINT_LABEL_KEY,
-                                              fingerprint)))
-        except ValueError:
+                                              fingerprint)))[0]
+        except IndexError:
             return None
         else:
             return image.id
+
+    def get_fingerprint_for_image_id(self, image_id):
+        labels = self.get_image_labels(image_id)
+        return labels.get(self.FINGERPRINT_LABEL_KEY)
 
     def get_image_id_by_tag(self, tag):
         try:
@@ -550,6 +600,14 @@ class Engine(BaseEngine, DockerSecretsMixin):
             return image.id
         except docker_errors.ImageNotFound:
             return None
+
+    def get_image_labels(self, image_id):
+        try:
+            image = self.client.images.get(image_id)
+        except docker_errors.ImageNotFound:
+            return {}
+        else:
+            return image.attrs['Config']['Labels']
 
     def get_latest_image_id_for_service(self, service_name):
         image = self.get_latest_image_for_service(service_name)
@@ -653,6 +711,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
                              container_id,
                              service_name,
                              fingerprint,
+                             role_name,
                              metadata,
                              with_name=False):
         metadata = metadata.copy()
@@ -671,6 +730,7 @@ class Engine(BaseEngine, DockerSecretsMixin):
             image_changes.append(u'VOLUME %s' % (mount_point,))
         image_config = utils.metadata_to_image_config(metadata)
         image_config.setdefault('Labels', {})[self.FINGERPRINT_LABEL_KEY] = fingerprint
+        image_config['Labels'][self.ROLE_LABEL_KEY] = role_name
         commit_data = dict(
             repository=image_name if with_name else None,
             tag=image_version if with_name else None,
@@ -879,14 +939,29 @@ class Engine(BaseEngine, DockerSecretsMixin):
                 else:
                     plainLogger.debug(line)
 
-    def _prepare_prebake_manifest(self, base_path, base_image, temp_dir, tarball):
+    @staticmethod
+    def _prepare_prebake_manifest(base_path, base_image, temp_dir, tarball):
         utils.jinja_render_to_temp(TEMPLATES_PATH,
                                    'conductor-src-dockerfile.j2', temp_dir,
                                    'Dockerfile',
                                    conductor_base=base_image,
                                    docker_version=DOCKER_VERSION)
+
         tarball.add(os.path.join(temp_dir, 'Dockerfile'),
                     arcname='Dockerfile')
+
+        utils.jinja_render_to_temp(TEMPLATES_PATH,
+                                   'atomic-help.j2', temp_dir,
+                                   'help.1',
+                                   ansible_container_version=container.__version__)
+        tarball.add(os.path.join(temp_dir, 'help.1'),
+                    arcname='help.1')
+
+        utils.jinja_render_to_temp(TEMPLATES_PATH,
+                                   'license.j2', temp_dir,
+                                   'LICENSE')
+        tarball.add(os.path.join(temp_dir, 'LICENSE'),
+                    arcname='LICENSE')
 
         container_dir = os.path.dirname(container.__file__)
         tarball.add(container_dir, arcname='container-src')
@@ -945,9 +1020,20 @@ class Engine(BaseEngine, DockerSecretsMixin):
                 container.__version__
             )
 
+        run_commands = []
+        if modules_to_install(base_path):
+            run_commands.append('pip install --no-cache-dir -r /_ansible/build/ansible-requirements.txt')
+        if roles_to_install(base_path):
+            run_commands.append('ansible-galaxy install -p /etc/ansible/roles -r /_ansible/build/requirements.yml')
+        if ansible_config_exists(base_path):
+            run_commands.append('cp /_ansible/build/ansible.cfg /etc/ansible/ansible.cfg')
+        separator = ' && \\\r\n'
+        install_requirements = separator.join(run_commands)
+
         utils.jinja_render_to_temp(TEMPLATES_PATH,
                                    'conductor-local-dockerfile.j2', temp_dir,
                                    'Dockerfile',
+                                   install_requirements=install_requirements,
                                    original_base=base_image,
                                    conductor_base=conductor_base,
                                    docker_version=DOCKER_VERSION)

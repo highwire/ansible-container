@@ -7,14 +7,22 @@ logger = logging.getLogger(__name__)
 
 """Prebake and push all new conductor images."""
 
+import os
 import subprocess
 
 from container.docker.engine import PREBAKED_DISTROS
 import container
 
 version = container.__version__
-subprocess.check_call(['python', 'setup.py', 'prebake'])
-for distro in PREBAKED_DISTROS:
+
+BASE_DISTRO = os.getenv('BASE_DISTRO');
+
+if BASE_DISTRO:
+    subprocess.check_call(['python', 'setup.py', 'prebake', '--distros', BASE_DISTRO])
+else:
+    subprocess.check_call(['python', 'setup.py', 'prebake'])
+
+for distro in ([BASE_DISTRO] if BASE_DISTRO else PREBAKED_DISTROS):
     print('Uploading %s...' % distro)
     distro_key = distro.replace(':', '-')
     print(['docker', 'tag',

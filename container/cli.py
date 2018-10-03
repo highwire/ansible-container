@@ -9,6 +9,7 @@ import sys
 import argparse
 import base64
 import json
+import subprocess
 
 import requests.exceptions
 
@@ -277,6 +278,8 @@ class HostCommand(object):
         parser.add_argument('--no-selinux', action='store_false', dest='selinux',
                             help=u"Disables the 'Z' option from being set on volumes automatically "
                                  u"mounted to the build container.", default=True)
+        parser.add_argument('--config-file', '-c', action='store', dest='config_file', default='container.yml',
+                            help=u"Configuration filename. Defaults to 'container.yml'")
 
         subparsers = parser.add_subparsers(title='subcommand', dest='subcommand')
         subparsers.required = True
@@ -321,8 +324,16 @@ class HostCommand(object):
             logger.error('The connection to Docker was refused. Check your Docker environment configuration.',
                          exc_info=False)
             sys.exit(1)
+        except exceptions.AnsibleContainerDockerConnectionAborted as e:
+            logger.error('The connection to Docker was aborted. Check your Docker environment configuration.\n'
+                         'ErrorMessage: %s' % str(e),
+                         exc_info=False)
+            sys.exit(1)
         except exceptions.AnsibleContainerConfigException as e:
             logger.error('Invalid container.yml: {}'.format(e), exc_info=False)
+            sys.exit(1)
+        except exceptions.AnsibleContainerRequestException as e:
+            logger.error("Invalid request: {}".format(e), exc_info=False)
             sys.exit(1)
         except requests.exceptions.ConnectionError:
             logger.error('Could not connect to container host. Check your docker config', exc_info=False)
@@ -355,6 +366,8 @@ def decode_b64json(encoded_params):
     return json.loads(base64.b64decode(encoded_params).decode())
 
 
+BYPASS_SERVICE_PROCESSING = ['push', 'install']
+
 @container.conductor_only
 def conductor_commandline():
     sys.stderr.write('Parsing conductor CLI args.\n')
@@ -385,9 +398,21 @@ def conductor_commandline():
         LOGGING['loggers']['container']['level'] = 'DEBUG'
     config.dictConfig(LOGGING)
 
-    containers_config = decoding_fn(args.config)
-    conductor_config = AnsibleContainerConductorConfig(list_to_ordereddict(containers_config))
+    # Copy a filtered subset of the mounted source into /src for use in builds
+    logger.info('Copying build context into Conductor container.')
+    p_obj = subprocess.Popen("rsync -av --filter=':- /_src/.dockerignore' /_src/ /src",
+                             shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    for stdout_line in iter(p_obj.stdout.readline, b''):
+        logger.debug(stdout_line)
+    p_obj.stdout.close()
+    return_code = p_obj.wait()
+    if return_code:
+        logger.error('Error copying build context: %s', p_obj.stderr.read())
+        sys.exit(p_obj.returncode)
 
+    containers_config = decoding_fn(args.config)
+    conductor_config = AnsibleContainerConductorConfig(list_to_ordereddict(containers_config),
+                                                       skip_services=args.command in BYPASS_SERVICE_PROCESSING)
     logger.debug('Starting Ansible Container Conductor: %s', args.command, services=conductor_config.services)
     getattr(core, 'conductorcmd_%s' % args.command)(
         args.engine,

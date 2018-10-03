@@ -11,7 +11,7 @@ Use Ansible Container to manage the container lifecycle from development, throug
 
 * `ansible-container init`
 
-  Creates a directory *ansible* with files to get you started. Read the comments, and edit to suit your needs.
+  Creates files in the *current directory* to get you started. Read the comments, and edit to suit your needs.
 
 * `ansible-container install`
 
@@ -34,14 +34,14 @@ Use Ansible Container to manage the container lifecycle from development, throug
 
 Install using *pip*, the Python package manager:
 
-    $ sudo pip install ansible-container[docker,openshift]
+    $ sudo pip install "ansible-container[docker,openshift]"
     
 Or, to install without root privileges, use [virtualenv](https://virtualenv.pypa.io/en/stable/) to first create a 
 Python sandbox:
     
     $ virtualenv ansible-container
     $ source ansible-container/bin/activate
-    $ pip install ansible-container[docker,openshift]
+    $ pip install "ansible-container[docker,openshift]"
 
 For more details, prerequisite, and instructions on installing the latest development release, please view our 
 [Installation Guide](https://docs.ansible.com/ansible-container/installation.html).
